@@ -44,7 +44,7 @@ def get_missing_fields(data: dict[str, Any]) -> list[str]:
             missing.append("time_range")
         if not data.get("district"):
             missing.append("district")
-            
+
     return missing
 
 
@@ -57,7 +57,7 @@ def interpret_request_node(state: State):
     if not isinstance(last_message, HumanMessage):
         return {"error": "Last message is not a HumanMessage."}
 
-    # If we are waiting for clarification, interpret this as a continuation
+    # Clarification continuation path
     if state.get("awaiting_clarification") and state.get("pending_request"):
         pending = state["pending_request"]
 
@@ -123,7 +123,7 @@ Rules:
                 "error": f"Model did not return valid JSON for clarification. Raw output: {raw_output}"
             }
 
-    # Fresh request
+    # Fresh request path
     system_prompt = """
 You are an information extraction system.
 
@@ -164,10 +164,25 @@ Rules:
 
     try:
         parsed = json.loads(raw_output)
+
+        # Backend-side validation for fresh requests
+        validated = {
+            "intent": parsed.get("intent"),
+            "metric": parsed.get("metric"),
+            "time_range": parsed.get("time_range"),
+            "chart_type": parsed.get("chart_type"),
+            "district": parsed.get("district"),
+        }
+
+        missing_fields = get_missing_fields(validated)
+        validated["needs_clarification"] = len(missing_fields) > 0
+        validated["missing_fields"] = missing_fields
+
         return {
-            "extracted": parsed,
+            "extracted": validated,
             "error": ""
         }
+
     except json.JSONDecodeError:
         return {
             "extracted": {},
@@ -326,11 +341,17 @@ def main():
         if not user_input:
             continue
 
+        # Reset temporary per-turn fields
+        state["assistant_response"] = ""
+        state["final_response"] = ""
+        state["error"] = ""
+        state["extracted"] = {}
+
         state["messages"].append(HumanMessage(content=user_input))
 
         result = graph.invoke(state)
 
-        # Keep the updated state for the next turn
+        # Persist updated state across turns
         state = result
 
         if result.get("error"):
