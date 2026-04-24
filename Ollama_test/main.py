@@ -11,6 +11,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 class State(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     extracted: dict[str, Any]
+    pending_request: dict[str, Any]
+    awaiting_clarification: bool
     assistant_response: str
     final_response: str
     error: str
@@ -22,6 +24,30 @@ llm = ChatOllama(
 )
 
 
+def get_missing_fields(data: dict[str, Any]) -> list[str]:
+    missing = []
+
+    if data.get("intent") == "chart_request":
+        if not data.get("metric"):
+            missing.append("metric")
+        if not data.get("time_range"):
+            missing.append("time_range")
+        if not data.get("chart_type"):
+            missing.append("chart_type")
+        if not data.get("district"):
+            missing.append("district")
+
+    elif data.get("intent") == "query_request":
+        if not data.get("metric"):
+            missing.append("metric")
+        if not data.get("time_range"):
+            missing.append("time_range")
+        if not data.get("district"):
+            missing.append("district")
+            
+    return missing
+
+
 def interpret_request_node(state: State):
     if not state.get("messages"):
         return {"error": "No messages found in state."}
@@ -31,6 +57,73 @@ def interpret_request_node(state: State):
     if not isinstance(last_message, HumanMessage):
         return {"error": "Last message is not a HumanMessage."}
 
+    # If we are waiting for clarification, interpret this as a continuation
+    if state.get("awaiting_clarification") and state.get("pending_request"):
+        pending = state["pending_request"]
+
+        system_prompt = f"""
+You are completing a partially filled user request.
+
+Current pending request:
+{json.dumps(pending, indent=2)}
+
+The user has provided a follow-up clarification message.
+Extract only the new information from the clarification.
+
+Return ONLY valid JSON.
+
+Use this exact schema:
+{{
+  "metric": "string or null",
+  "time_range": "string or null",
+  "chart_type": "string or null",
+  "district": "string or null"
+}}
+
+Rules:
+- Only extract what the user is clarifying now.
+- Use null for fields not provided in this clarification message.
+- Do not repeat old values unless they are explicitly mentioned again.
+"""
+
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=last_message.content),
+        ])
+
+        raw_output = response.content.strip()
+
+        try:
+            parsed = json.loads(raw_output)
+
+            merged = {
+                "intent": pending.get("intent"),
+                "metric": pending.get("metric"),
+                "time_range": pending.get("time_range"),
+                "chart_type": pending.get("chart_type"),
+                "district": pending.get("district"),
+            }
+
+            for key in ["metric", "time_range", "chart_type", "district"]:
+                if parsed.get(key) is not None:
+                    merged[key] = parsed[key]
+
+            missing_fields = get_missing_fields(merged)
+            merged["needs_clarification"] = len(missing_fields) > 0
+            merged["missing_fields"] = missing_fields
+
+            return {
+                "extracted": merged,
+                "error": ""
+            }
+
+        except json.JSONDecodeError:
+            return {
+                "extracted": {},
+                "error": f"Model did not return valid JSON for clarification. Raw output: {raw_output}"
+            }
+
+    # Fresh request
     system_prompt = """
 You are an information extraction system.
 
@@ -56,7 +149,6 @@ Rules:
 - If the user greets or speaks casually, use "general_chat".
 - If the user asks for a chart or visualization, use "chart_request".
 - If the user asks for values, analysis, statistics, or data, use "query_request".
-- If the user answers a previous clarification question, use "clarification_answer".
 - If unsupported, use "unsupported".
 - If important information is missing, set "needs_clarification" to true.
 - Use null for missing fields.
@@ -91,12 +183,16 @@ def prepare_user_message_node(state: State):
 
     if intent == "general_chat":
         return {
-            "assistant_response": "Hello! How can I help you today?"
+            "assistant_response": "Hello! How can I help you today?",
+            "awaiting_clarification": False,
+            "pending_request": {}
         }
 
     if intent == "unsupported":
         return {
-            "assistant_response": "I do not support this type of request yet."
+            "assistant_response": "I do not support this type of request yet.",
+            "awaiting_clarification": False,
+            "pending_request": {}
         }
 
     if needs_clarification:
@@ -111,25 +207,35 @@ def prepare_user_message_node(state: State):
 
         if questions:
             return {
-                "assistant_response": " ".join(questions)
+                "assistant_response": " ".join(questions),
+                "awaiting_clarification": True,
+                "pending_request": extracted
             }
         else:
             return {
-                "assistant_response": "Please provide more details so I can complete your request."
+                "assistant_response": "Please provide more details so I can complete your request.",
+                "awaiting_clarification": True,
+                "pending_request": extracted
             }
 
     if intent == "chart_request":
         return {
-            "assistant_response": "I am preparing your chart."
+            "assistant_response": "I am preparing your chart.",
+            "awaiting_clarification": False,
+            "pending_request": {}
         }
 
     if intent == "query_request":
         return {
-            "assistant_response": "I am preparing the requested information."
+            "assistant_response": "I am preparing the requested information.",
+            "awaiting_clarification": False,
+            "pending_request": {}
         }
 
     return {
-        "assistant_response": "Your request has been received."
+        "assistant_response": "Your request has been received.",
+        "awaiting_clarification": False,
+        "pending_request": {}
     }
 
 
@@ -201,8 +307,14 @@ graph = graph_builder.compile()
 
 
 def main():
-    print("CLI Demo - LangGraph + Ollama")
+    print("CLI Demo - LangGraph + Ollama (Stateful Clarification)")
     print("Type 'exit' or 'quit' to stop.\n")
+
+    state: State = {
+        "messages": [],
+        "pending_request": {},
+        "awaiting_clarification": False
+    }
 
     while True:
         user_input = input("USER: ").strip()
@@ -214,11 +326,12 @@ def main():
         if not user_input:
             continue
 
-        initial_state: State = {
-            "messages": [HumanMessage(content=user_input)]
-        }
+        state["messages"].append(HumanMessage(content=user_input))
 
-        result = graph.invoke(initial_state)
+        result = graph.invoke(state)
+
+        # Keep the updated state for the next turn
+        state = result
 
         if result.get("error"):
             print("\nERROR:")
@@ -234,6 +347,12 @@ def main():
 
         if result.get("final_response"):
             print(f"AI (final): {result['final_response']}")
+
+        print("\n[STATE]")
+        print(json.dumps({
+            "awaiting_clarification": result.get("awaiting_clarification", False),
+            "pending_request": result.get("pending_request", {})
+        }, indent=2, ensure_ascii=False))
 
         print()
 
