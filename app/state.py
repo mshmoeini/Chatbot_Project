@@ -8,15 +8,16 @@ class AppState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
 
     extracted: dict[str, Any]
-    pending_request: dict[str, Any]
     resolved_request: dict[str, Any]
+
+    confirmation_message: str
+    last_human_gate: str
+
+    query_draft: str
+    approved_query: str
+
+    execution_result: dict[str, Any]
     last_executed_request: dict[str, Any]
     execution_history: list[dict[str, Any]]
 
-    awaiting_clarification: bool
-    awaiting_confirmation: bool
-
-    confirmation_message: str
-    assistant_response: str
-    final_response: str
     error: str
